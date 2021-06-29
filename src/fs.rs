@@ -71,6 +71,7 @@ pub struct EnvFs {
     inode_counter: Arc<RwLock<InodeCounter>>,
     fuse_fd: RawFd,
     fallback_paths: Arc<Vec<PathBuf>>,
+    fallback_inodes: Arc<Vec<Arc<Inode>>>,
 }
 
 impl EnvFs {
@@ -86,14 +87,22 @@ impl EnvFs {
             "Cannot raise file descriptor limit"
         );
 
+        let fallback_inodes = fallback_inodes()?;
+
+        let inodes = ConcHashMap::<u64, Arc<Inode>>::new();
+        for inode in fallback_inodes.iter() {
+            inodes.insert(inode.ino, inode.clone());
+        }
+
         Ok(EnvFs {
-            inodes: Arc::new(ConcHashMap::<u64, Arc<Inode>>::new()),
+            inodes: Arc::new(inodes),
             inode_counter: Arc::new(RwLock::new(InodeCounter {
-                next_number: 3,
+                next_number: 5,
                 generation: 0,
             })),
             fuse_fd: fuse_fd.into_raw_fd(),
             fallback_paths: Arc::new(fallback_paths.to_vec()),
+            fallback_inodes: Arc::new(fallback_inodes),
         })
     }
 
@@ -153,6 +162,7 @@ impl EnvFs {
                 inode_counter: Arc::clone(&self.inode_counter),
                 fuse_fd: self.fuse_fd,
                 fallback_paths: Arc::clone(&self.fallback_paths),
+                fallback_inodes: Arc::clone(&self.fallback_inodes),
             };
 
             let max_background = num_sessions as u16;
@@ -192,6 +202,26 @@ macro_rules! tryfuse {
             }
         }
     };
+}
+
+pub fn fallback_inodes() -> Result<Vec<Arc<Inode>>> {
+    let mut next_number = 3;
+    Ok(vec!["sh", "env"]
+        .iter()
+        .map(|name| {
+            let attr = symlink_attr(next_number);
+            next_number += 1;
+            Arc::new(Inode {
+                name: PathBuf::from(name),
+                path: [r"/run/current-system/sw/bin/", name].iter().collect(),
+                fallback_path: true,
+                pid: Pid::from_raw(0),
+                kind: attr.kind,
+                ino: attr.ino,
+                nlookup: RwLock::new(1),
+            })
+        })
+        .collect())
 }
 
 fn symlink_attr(ino: u64) -> FileAttr {
@@ -339,6 +369,14 @@ impl Filesystem for EnvFs {
 
         let pid = Pid::from_raw(req.pid() as i32);
 
+        match self.fallback_inodes.iter().find(|&i| i.name == name) {
+            Some(inode) => {
+                reply.entry(&Duration::from_secs(1000), &symlink_attr(inode.ino), 0);
+                return;
+            }
+            None => {}
+        }
+
         match resolve_target(pid, &name, self.fallback_paths.as_slice()) {
             Some(exe) => {
                 let (next_number, generation) = self.next_inode_number();
@@ -398,10 +436,13 @@ impl Filesystem for EnvFs {
             return;
         }
 
-        let entries = vec![
-            (1, FileType::Directory, "."),
-            (1, FileType::Directory, ".."),
+        let mut entries = vec![
+            (1, FileType::Directory, OsStr::new(".")),
+            (1, FileType::Directory, OsStr::new("..")),
         ];
+        for inode in self.fallback_inodes.iter() {
+            entries.push((inode.ino, inode.kind, inode.name.as_os_str()));
+        }
 
         for (i, entry) in entries.into_iter().enumerate().skip(offset as usize) {
             // i + 1 means the index of the next entry
@@ -446,7 +487,7 @@ impl Filesystem for EnvFs {
     fn readlink(&mut self, req: &Request, ino: u64, reply: ReplyData) {
         let inode = tryfuse!(self.inode(ino), reply);
         let pid = Pid::from_raw(req.pid() as i32);
-        if inode.pid != pid {
+        if !inode.fallback_path && inode.pid != pid {
             // unlikely
             match resolve_target(pid, &inode.name, &self.fallback_paths) {
                 Some(exe) => {
