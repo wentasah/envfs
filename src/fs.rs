@@ -412,11 +412,10 @@ impl Filesystem for EnvFs {
     }
 
     fn statfs(&mut self, _req: &Request, ino: u64, reply: ReplyStatfs) {
-        let inode = tryfuse!(self.inode(ino), reply);
-
-        if inode.fallback_path {
-            // Ugly work around for `make`, which does stat on `/bin/sh`
-            // We should fix our nixpkgs make to not do that and rely on `sh`
+        if ino == 1             // .
+            || tryfuse!(self.inode(ino), reply).fallback_path
+        {
+            // Ugly work around. `make` does stat on `/bin/sh`, `slack` does statfs /bin/.
             reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
         } else {
             reply.error(ENOENT);
